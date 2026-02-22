@@ -1,0 +1,6 @@
+# dependencies - never push this, it's huge
+node_modules/
+
+# environment variables - contains your secrets, never push this
+.env
+
