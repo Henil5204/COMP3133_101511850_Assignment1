@@ -1,14 +1,19 @@
 // graphql/resolvers.js
-// v3.0.0
+// v4.0.0
 //
-// All 8 required operations + the bonus "me" query.
-// Each resolver validates its input, does the DB work, and returns clean data.
-// Errors are thrown using the helpers in utils/errors.js so Apollo formats them nicely.
+// All 8 required operations + bonus "me" query.
+//
+// Photo handling:
+//   - addEmployee and updateEmployee both accept an employee_photo argument
+//   - Pass the Cloudinary URL you got from POST /api/upload
+//   - OR use the combined REST endpoints:
+//       POST /api/employees/photo   — create employee with photo in one shot
+//       PUT  /api/employees/:id/photo — update employee with photo in one shot
 
 const User     = require("../models/User");
 const Employee = require("../models/Employee");
 const { requireAuth, signToken } = require("../middleware/auth");
-const { notFound, badInput, conflict }  = require("../utils/errors");
+const { notFound, badInput, conflict } = require("../utils/errors");
 const {
   requireField,
   validateEmail,
@@ -25,18 +30,14 @@ const pickDefined = (obj) =>
     Object.entries(obj).filter(([, v]) => v !== undefined && v !== null)
   );
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 const resolvers = {
 
-  // ── Custom field resolvers ───────────────────────────────────────────────
-  // These handle fields that need a little massaging before sending to the client
-
+  // ── Field resolvers ──────────────────────────────────────────────────────
   Employee: {
-    full_name:       (e)  => `${e.first_name} ${e.last_name}`,
-    date_of_joining: (e)  => new Date(e.date_of_joining).toISOString().split("T")[0],
-    created_at:      (e)  => e.created_at?.toISOString(),
-    updated_at:      (e)  => e.updated_at?.toISOString(),
+    full_name:       (e) => `${e.first_name} ${e.last_name}`,
+    date_of_joining: (e) => new Date(e.date_of_joining).toISOString().split("T")[0],
+    created_at:      (e) => e.created_at?.toISOString(),
+    updated_at:      (e) => e.updated_at?.toISOString(),
   },
 
   User: {
@@ -44,27 +45,22 @@ const resolvers = {
     updated_at: (u) => u.updated_at?.toISOString(),
   },
 
-
-  // ── Queries ───────────────────────────────────────────────────────────────
-
+  // ── Queries ──────────────────────────────────────────────────────────────
   Query: {
 
     // ─ 2. Login ──────────────────────────────────────────────────────────────
-    // Accepts username OR email + password. Returns a JWT + the user object.
     login: async (_, { usernameOrEmail, password }) => {
       requireField(usernameOrEmail, "usernameOrEmail");
       requireField(password, "password");
 
       const user = await User.findByCredential(usernameOrEmail);
 
-      // same error message for both "user doesn't exist" and "wrong password"
-      // so we don't leak info about what accounts exist
       if (!user || !(await user.comparePassword(password))) {
-        throw badInput("Those credentials don't match anything in our system. Double-check and try again.");
+        throw badInput("Those credentials don't match. Double-check and try again.");
       }
 
       if (!user.is_active) {
-        throw badInput("This account has been deactivated. Reach out to support if that's unexpected.");
+        throw badInput("This account has been deactivated. Reach out to support.");
       }
 
       logger.info(`User "${user.username}" logged in`);
@@ -77,18 +73,14 @@ const resolvers = {
       };
     },
 
-
     // ─ 3. Get all employees ──────────────────────────────────────────────────
-    // Protected. Supports page/limit pagination so it doesn't blow up on large datasets.
     getAllEmployees: async (_, { page = 1, limit = 20 }, context) => {
       requireAuth(context);
 
-      // clamp values so nobody passes page=0 or limit=99999
       const safePage  = Math.max(1, page);
       const safeLimit = Math.min(100, Math.max(1, limit));
       const skip      = (safePage - 1) * safeLimit;
 
-      // run both queries at the same time instead of one after the other
       const [employees, total] = await Promise.all([
         Employee.find().sort({ created_at: -1 }).skip(skip).limit(safeLimit),
         Employee.countDocuments(),
@@ -96,7 +88,6 @@ const resolvers = {
 
       return { total, employees };
     },
-
 
     // ─ 5. Search employee by ID ───────────────────────────────────────────────
     searchEmployeeById: async (_, { eid }, context) => {
@@ -109,14 +100,12 @@ const resolvers = {
       return employee;
     },
 
-
     // ─ 8. Search by designation OR department ────────────────────────────────
-    // Case-insensitive partial match on either (or both) fields.
     searchEmployeeByDesignationOrDepartment: async (_, { designation, department }, context) => {
       requireAuth(context);
 
       if (!designation && !department) {
-        throw badInput("You need to pass at least one of: designation, department.");
+        throw badInput("Provide at least one of: designation, department.");
       }
 
       const filters = [];
@@ -127,17 +116,13 @@ const resolvers = {
       return { total: employees.length, employees };
     },
 
-
     // ─ Bonus: me ─────────────────────────────────────────────────────────────
-    // Quick way to confirm your token works and see your own profile.
     me: async (_, __, context) => {
       return requireAuth(context);
     },
   },
 
-
-  // ── Mutations ─────────────────────────────────────────────────────────────
-
+  // ── Mutations ────────────────────────────────────────────────────────────
   Mutation: {
 
     // ─ 1. Signup ──────────────────────────────────────────────────────────────
@@ -149,18 +134,18 @@ const resolvers = {
       validateEmail(email);
       validatePassword(password);
 
-      if (username.length < 3) throw badInput("Username must be at least 3 characters.");
+      if (username.length < 3)
+        throw badInput("Username must be at least 3 characters.");
       if (!/^[a-zA-Z0-9_]+$/.test(username))
-        throw badInput("Username can only have letters, numbers, and underscores — no spaces.");
+        throw badInput("Username can only have letters, numbers, and underscores.");
 
-      // check both fields in one query
       const taken = await User.findOne({
         $or: [{ username: username.trim() }, { email: email.toLowerCase().trim() }],
       });
 
       if (taken) {
         if (taken.username === username.trim())
-          throw conflict("That username is already taken — try a different one.");
+          throw conflict("That username is already taken.");
         throw conflict("That email is already registered.");
       }
 
@@ -174,19 +159,28 @@ const resolvers = {
       return user;
     },
 
-
     // ─ 4. Add employee ────────────────────────────────────────────────────────
-    // employee_photo should be the URL you got back from POST /api/upload
+    //
+    // employee_photo is optional — two ways to provide it:
+    //
+    //   Option A (GraphQL only):
+    //     1. Call POST /api/upload with the image file → get back a URL
+    //     2. Pass that URL as employee_photo here
+    //
+    //   Option B (one-shot REST):
+    //     Skip this mutation entirely and use:
+    //     POST /api/employees/photo  (multipart/form-data with photo + all fields)
+    //
     addEmployee: async (_, args, context) => {
       requireAuth(context);
 
       const {
         first_name, last_name, email,
         gender, designation, salary,
-        date_of_joining, department, employee_photo,
+        date_of_joining, department,
+        employee_photo,  // Cloudinary URL — optional
       } = args;
 
-      // make sure all required fields are present
       requireField(first_name,  "first_name");
       requireField(last_name,   "last_name");
       requireField(email,       "email");
@@ -197,9 +191,9 @@ const resolvers = {
       validateSalary(salary);
       const joinDate = validateDate(date_of_joining, "date_of_joining");
 
-      // check duplicate email before trying to insert
       const duplicate = await Employee.findOne({ email: email.toLowerCase().trim() });
-      if (duplicate) throw conflict(`There's already an employee with the email "${email}".`);
+      if (duplicate)
+        throw conflict(`An employee with email "${email}" already exists.`);
 
       const employee = await Employee.create({
         first_name:      first_name.trim(),
@@ -217,9 +211,17 @@ const resolvers = {
       return employee;
     },
 
-
     // ─ 6. Update employee ────────────────────────────────────────────────────
-    // Only the fields you actually pass in get changed — everything else stays the same.
+    //
+    // employee_photo is optional — two ways to update it:
+    //
+    //   Option A (GraphQL only):
+    //     1. Call POST /api/upload with the new image → get back a URL
+    //     2. Pass that URL as employee_photo here
+    //
+    //   Option B (one-shot REST):
+    //     PUT /api/employees/:eid/photo  (multipart/form-data with photo + fields to update)
+    //
     updateEmployee: async (_, { eid, ...updates }, context) => {
       requireAuth(context);
       validateObjectId(eid, "eid");
@@ -227,14 +229,14 @@ const resolvers = {
       const existing = await Employee.findById(eid);
       if (!existing) throw notFound(`Employee with ID "${eid}"`);
 
-      // validate whatever was provided
       if (updates.email) {
         validateEmail(updates.email);
         const emailTaken = await Employee.findOne({
           email: updates.email.toLowerCase().trim(),
           _id:   { $ne: eid },
         });
-        if (emailTaken) throw conflict(`The email "${updates.email}" is already in use.`);
+        if (emailTaken)
+          throw conflict(`The email "${updates.email}" is already in use by another employee.`);
         updates.email = updates.email.trim();
       }
 
@@ -243,17 +245,18 @@ const resolvers = {
         updates.date_of_joining = validateDate(updates.date_of_joining, "date_of_joining");
       }
 
-      // trim strings if present
       ["first_name", "last_name", "designation", "department"].forEach((f) => {
         if (updates[f]) updates[f] = updates[f].trim();
       });
 
       if (updates.salary) updates.salary = parseFloat(updates.salary);
 
+      // employee_photo — if a new URL was passed, update it; otherwise leave it alone
+      // (null means "keep existing photo", undefined also keeps existing)
+
       const clean = pickDefined(updates);
-      if (Object.keys(clean).length === 0) {
-        throw badInput("Nothing to update — you need to pass at least one field.");
-      }
+      if (Object.keys(clean).length === 0)
+        throw badInput("Nothing to update — pass at least one field.");
 
       const updated = await Employee.findByIdAndUpdate(
         eid,
@@ -264,7 +267,6 @@ const resolvers = {
       logger.info(`Employee updated: ${eid}`);
       return updated;
     },
-
 
     // ─ 7. Delete employee ────────────────────────────────────────────────────
     deleteEmployee: async (_, { eid }, context) => {
